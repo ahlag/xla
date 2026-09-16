@@ -1959,7 +1959,12 @@ message DebugOptions {
   // dimension are tiled for now; extend to the other cases.
   optional bool xla_gpu_experimental_enable_reduction_dimension_tiling = 558;
 
-  // Next id: 559
+  // Lowers eligible associative kScan instructions to Triton fusions
+  // (ScanRewriterTriton). Requires
+  // xla_gpu_experimental_enable_tiling_propagation.
+  optional bool xla_gpu_experimental_enable_triton_scan = 559;
+
+  // Next id: 560
 
   // Extra options to pass to the compilation backend (e.g. LLVM); specific
   // interpretation of these values is left to the backend.
