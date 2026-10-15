@@ -19,19 +19,32 @@ Bazel targets using bazel-diff (with cquery by default), filters and normalizes
 labels for XLA, and produces a decision (FULL, SKIP, or IMPACTED targets).
 """
 
+import argparse
 from collections.abc import Iterable, Mapping, Sequence
 import dataclasses
 import enum
 import hashlib
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 from typing import Any, List, Optional, Protocol, Tuple
 
+# Ensure the XLA repository root is on sys.path when invoked directly as a
+# script in OSS (e.g. `python3 build_tools/ci/bazel_diff.py` without
+# PYTHONPATH).
+_XLA_SRC_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if _XLA_SRC_ROOT not in sys.path:
+  sys.path.insert(0, _XLA_SRC_ROOT)
+
+# pylint: disable=g-import-not-at-top
 from build_tools.ci import change_detector
+# pylint: enable=g-import-not-at-top
 
 BAZEL_DIFF_VERSION = "v46.1.0"
 BAZEL_DIFF_JAR_URL = "https://github.com/Tinder/bazel-diff/releases/download/v46.1.0/bazel-diff_deploy.jar"
@@ -652,3 +665,177 @@ def compute_impacted_targets(
       changed_files_count=changed_count,
       elapsed_seconds=time.time() - start_time,
   )
+
+
+@dataclasses.dataclass
+class CliBuildConfig:
+  """Concrete BuildConfig constructed from CLI flags."""
+
+  target_patterns: Sequence[str] = ("//xla/...",)
+  configs: Sequence[str] = ()
+  repo_env: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+  options: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+  startup_options: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+  bazel_diff_use_cquery: bool = False
+
+
+def _write_github_output(
+    github_output: str,
+    *,
+    decision: BazelDiffDecisionType,
+    should_skip: bool,
+    target_pattern_file: str = "",
+) -> None:
+  """Writes decision, should_skip, and target_pattern_file to $GITHUB_OUTPUT."""
+  if not github_output:
+    return
+  try:
+    with open(github_output, "a", encoding="utf-8") as f:
+      f.write(f"decision={decision.value}\n")
+      f.write(f"should_skip={'true' if should_skip else 'false'}\n")
+      f.write(f"target_pattern_file={target_pattern_file}\n")
+  except OSError as e:
+    logging.warning(
+        "Failed to write to GITHUB_OUTPUT (%s): %s", github_output, e
+    )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+  """CLI entry point for standalone bazel-diff target selection in CI."""
+  logging.basicConfig(level=logging.INFO)
+  parser = argparse.ArgumentParser(
+      description="Compute impacted Bazel targets between two git revisions."
+  )
+  parser.add_argument(
+      "--base_sha",
+      default=os.environ.get("XLA_CI_BAZEL_DIFF_BASE_SHA", ""),
+      help="Base git revision to compare against.",
+  )
+  parser.add_argument(
+      "--head_sha",
+      default=os.environ.get("XLA_CI_BAZEL_DIFF_HEAD_SHA", "HEAD") or "HEAD",
+      help="Head git revision to compare.",
+  )
+  parser.add_argument(
+      "--workspace_dir",
+      default=".",
+      help="Path to the Bazel workspace root.",
+  )
+  parser.add_argument(
+      "--build_name",
+      default="xla_ci",
+      help="Build name used in step summary reports.",
+  )
+  parser.add_argument(
+      "--target_pattern",
+      action="append",
+      dest="target_patterns",
+      help="Bazel target pattern to filter impacted targets (repeatable).",
+  )
+  parser.add_argument(
+      "--config",
+      action="append",
+      dest="configs",
+      default=[],
+      help="Bazel --config option for cquery (repeatable).",
+  )
+  parser.add_argument(
+      "--use_cquery",
+      action="store_true",
+      help="Use bazel cquery instead of unconfigured query for target hashing.",
+  )
+  parser.add_argument(
+      "--output_target_pattern_file",
+      default="",
+      help="Optional destination path for the filtered impacted targets file.",
+  )
+  parser.add_argument(
+      "--github_output",
+      default=os.environ.get("GITHUB_OUTPUT", ""),
+      help="Path to GitHub Actions $GITHUB_OUTPUT file.",
+  )
+  args = parser.parse_args(argv)
+
+  disabled = os.environ.get("XLA_CI_DISABLE_BAZEL_DIFF", "false").lower() in (
+      "true",
+      "1",
+      "yes",
+  )
+  base_sha = args.base_sha.strip()
+  head_sha = args.head_sha.strip() or "HEAD"
+  if disabled or not base_sha:
+    _write_github_output(
+        args.github_output,
+        decision=BazelDiffDecisionType.FULL,
+        should_skip=False,
+    )
+    return 0
+
+  skip_decision = change_detector.evaluate_skip(
+      base_sha, head_sha, cwd=args.workspace_dir, is_jax_build=False
+  )
+  if skip_decision.should_skip:
+    change_detector.report_skip(skip_decision, args.build_name)
+    _write_github_output(
+        args.github_output,
+        decision=BazelDiffDecisionType.SKIP,
+        should_skip=True,
+    )
+    return 0
+
+  target_patterns = (
+      tuple(args.target_patterns) if args.target_patterns else ("//xla/...",)
+  )
+  build_config = CliBuildConfig(
+      target_patterns=target_patterns,
+      configs=tuple(args.configs),
+      bazel_diff_use_cquery=args.use_cquery,
+  )
+  decision = compute_impacted_targets(
+      build_config, base_sha, head_sha, workspace_dir=args.workspace_dir
+  )
+  report_decision(decision, args.build_name)
+
+  if decision.decision == BazelDiffDecisionType.SKIP:
+    _write_github_output(
+        args.github_output,
+        decision=BazelDiffDecisionType.SKIP,
+        should_skip=True,
+    )
+    return 0
+
+  if (
+      decision.decision == BazelDiffDecisionType.IMPACTED
+      and decision.impacted_targets_file
+  ):
+    target_file = decision.impacted_targets_file
+    if args.output_target_pattern_file:
+      try:
+        shutil.copyfile(target_file, args.output_target_pattern_file)
+        target_file = os.path.abspath(args.output_target_pattern_file)
+      except OSError as e:
+        logging.warning("Failed to copy target_pattern_file: %s", e)
+        _write_github_output(
+            args.github_output,
+            decision=BazelDiffDecisionType.FULL,
+            should_skip=False,
+        )
+        return 0
+    _write_github_output(
+        args.github_output,
+        decision=BazelDiffDecisionType.IMPACTED,
+        should_skip=False,
+        target_pattern_file=target_file,
+    )
+    return 0
+
+  _write_github_output(
+      args.github_output,
+      decision=BazelDiffDecisionType.FULL,
+      should_skip=False,
+  )
+  return 0
+
+
+if __name__ == "__main__":
+  sys.exit(main())
