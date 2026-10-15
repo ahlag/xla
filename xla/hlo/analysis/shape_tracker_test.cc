@@ -146,6 +146,17 @@ TEST(ShapeTrackerTest, GetInvertedSimple) {
   EXPECT_EQ(inverted.output_shape().dimensions(), (std::vector<int64_t>{2, 3}));
 }
 
+TEST(ShapeTrackerTest, GetInvertedPreservesInputLayout) {
+  Shape shape = ShapeUtil::MakeShapeWithDenseLayout(F32, {2, 3, 4}, {0, 1, 2});
+  ShapeTracker tracker(shape);
+  ASSERT_TRUE(tracker.AppendTranspose({2, 0, 1}).ok());
+  ASSERT_TRUE(tracker.AppendReshape({4, 6}).ok());
+
+  auto inverted_or = tracker.GetInverted();
+  ASSERT_TRUE(inverted_or.ok());
+  EXPECT_EQ(inverted_or->output_shape(), shape);
+}
+
 TEST(ShapeTrackerTest, AppendBitcastSimple) {
   Shape src_shape = ShapeUtil::MakeShape(F32, {6});
   Shape dst_shape = ShapeUtil::MakeShape(F32, {2, 3});
@@ -166,12 +177,40 @@ TEST(ShapeTrackerTest, AppendBitcastWithLayout) {
   EXPECT_EQ(tracker.output_shape().dimensions(), (std::vector<int64_t>{6}));
 }
 
-TEST(ShapeTrackerTest, AppendBitcastFail) {
+TEST(ShapeTrackerTest, AppendBitcastNonFactorizable) {
   Shape src_shape = ShapeUtil::MakeShape(F32, {2, 3});
   Shape dst_shape = ShapeUtil::MakeShape(F32, {3, 2});
 
   ShapeTracker tracker(src_shape);
-  EXPECT_FALSE(tracker.AppendBitcast(src_shape, dst_shape).ok());
+  ASSERT_TRUE(tracker.AppendBitcast(src_shape, dst_shape).ok());
+
+  ShapeTracker expected(src_shape);
+  ASSERT_TRUE(expected.AppendReshape({3, 2}).ok());
+  EXPECT_EQ(tracker, expected);
+
+  // Changing the layout between {1,0} and {0,1} reshapes the physical buffer
+  // from [2,3] to [3,2] and transposes it back to [2,3], so individual
+  // dimensions cannot be mapped or narrowed across the bitcast.
+  Shape dst_col_major =
+      ShapeUtil::MakeShapeWithDenseLayout(F32, {2, 3}, {0, 1});
+  ShapeTracker col_major_tracker(src_shape);
+  ASSERT_TRUE(col_major_tracker.AppendBitcast(src_shape, dst_col_major).ok());
+  EXPECT_EQ(col_major_tracker.DebugString(), "[2,3] -> R[3,2] -> T[2,3]");
+  EXPECT_EQ(col_major_tracker.MapInputDimensionsToOutputUnordered({0}),
+            std::nullopt);
+  EXPECT_FALSE(col_major_tracker.Narrow({0}).ok());
+}
+
+TEST(ShapeTrackerTest, AppendBitcastIncompatible) {
+  Shape src_shape = ShapeUtil::MakeShape(F32, {2, 3});
+  ShapeTracker tracker(src_shape);
+
+  EXPECT_FALSE(
+      tracker.AppendBitcast(src_shape, ShapeUtil::MakeShape(F32, {2, 4})).ok());
+  EXPECT_FALSE(tracker
+                   .AppendBitcast(ShapeUtil::MakeShape(F32, {3, 2}),
+                                  ShapeUtil::MakeShape(F32, {2, 3}))
+                   .ok());
 }
 
 TEST(ShapeTrackerTest, AppendBitcastTricky) {
